@@ -139,3 +139,7 @@ wandb/
 nohup.out
 multirun
 outputs
+
+gpt2_bpe/**/*
+wikitext-103-raw/**/*
+**/*.zip
