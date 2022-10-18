@@ -3,11 +3,13 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from csv import excel
 from functools import lru_cache
 
 import numpy as np
 import torch
 from fairseq.data import Dictionary, data_utils
+from fairseq.pdb import distributed_set_trace as bp
 
 from . import BaseWrapperDataset, LRUCacheDataset
 
@@ -115,7 +117,7 @@ class MaskTokensDataset(BaseWrapperDataset):
     def __getitem_cached__(self, seed: int, epoch: int, index: int):
         with data_utils.numpy_seed(self.seed, self.epoch, index):
             item = self.dataset[index]
-            sz = len(item)
+            sz = len(item) 
 
             assert (
                 self.mask_idx not in item
@@ -217,4 +219,400 @@ class MaskTokensDataset(BaseWrapperDataset):
                         p=self.weights,
                     )
 
+            return torch.from_numpy(new_item)
+
+class MaskStrategyTokensDataset(MaskTokensDataset):
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        vocab: Dictionary,
+        pad_idx: int,
+        mask_idx: int,
+        return_masked_tokens: bool = False,
+        seed: int = 1,
+        mask_prob: float = 0.15,
+        mask_prob_range: str = "none",
+        mask_impl: str = "fix",
+        seqlen_masking_flag: bool = False,
+        seqlen_masking_granularity: str = "none",
+        seqlen_masking_boundary: str = None,
+        learned_unmask_table: dict = None,
+        max_seq_length: int = None,
+        avoid_eos: bool = False,
+        bos: int = None,
+        eos: int = None,
+        leave_unmasked_prob: float = 0.1,
+        random_token_prob: float = 0.1,
+        freq_weighted_replacement: bool = False,
+        mask_whole_words: torch.Tensor = None,
+        mask_multiple_length: int = 1,
+        mask_stdev: float = 0.0,
+    ):
+        super().__init__(dataset, vocab, pad_idx, mask_idx, return_masked_tokens, seed, mask_prob, leave_unmasked_prob,
+                         random_token_prob, freq_weighted_replacement, mask_whole_words, mask_multiple_length,
+                         mask_stdev)
+        self.mask_impl = mask_impl
+        self.mask_prob_range = mask_prob_range
+        if self.mask_prob_range != "none":
+            assert "-" in self.mask_prob_range
+            tmp = self.mask_prob_range.split("-")
+            assert len(tmp) == 2
+            self.mask_prob_low, self.mask_prob_high = map(eval, tmp)
+            assert self.mask_prob_low <= self.mask_prob_high
+            
+        self.seqlen_masking_flag = seqlen_masking_flag
+        self.seqlen_masking_granularity = seqlen_masking_granularity
+        self.seqlen_masking_boundary = seqlen_masking_boundary
+        if self.seqlen_masking_boundary is not None and self.seqlen_masking_boundary != "none":
+            assert "-" in self.seqlen_masking_boundary
+            tmp = self.seqlen_masking_boundary.split("-")
+            assert len(tmp) == 2
+            self.seqlen_masking_low, self.seqlen_masking_high = map(eval, tmp)
+            self.seqlen_masking_low <= self.seqlen_masking_high
+        self.avoid_eos = self.seqlen_masking_granularity == "eos-eos"
+        
+        # self.use_learned_unmask_table = use_learned_unmask_table
+        self.learned_unmask_table = learned_unmask_table
+        self.max_seq_length = max_seq_length
+        
+        if avoid_eos and eos is None:
+            raise ValueError("eos can't be None when `avoid_eos=True`")
+        self.eos = eos
+        self.bos = bos
+    
+    @lru_cache(maxsize=8)
+    def __getitem_cached_eos__(self, seed: int, epoch: int, index: int):
+        with data_utils.numpy_seed(self.seed, self.epoch, index):
+            sample = self.dataset[index]
+            sample_shape = sample.shape
+
+            N = len(sample)
+            single_token_masking_rate = (1+N)/(2*N) # single_token_masking_rate
+            assert (
+                self.mask_idx not in sample
+            ), "Dataset contains mask_idx (={}), this is not expected!".format(
+                self.mask_idx,
+            )
+            # decide whether we need to mask bos and mask it
+            new_sample = []
+            if self.bos is not None and sample[0] == self.bos:
+                bos = sample[:1]
+                sample = sample[1:]
+                if np.random.uniform() <= single_token_masking_rate: 
+                    # apply mask to a single token
+                    new_sample.append(bos if self.return_masked_tokens else torch.tensor([self.mask_idx]))
+                else:
+                    new_sample.append(torch.tensor([self.pad_idx]) if self.return_masked_tokens else bos)
+            # figureout the span for different sentences in a segment/sequence
+            # Note: sentence = <list of tokens> + eos; <list of tokens> can be empty
+            # [start_idx, end_idx), end_idx is exclusive
+            sentences_mask = torch.cumsum((sample == self.eos).long(), dim=0)
+            sentence_spans = []
+            next_start_pos = 0 # position of last sentence's end
+            for cur_pos, m in enumerate(sentences_mask):
+                if m == len(sentence_spans) + 1: 
+                    start_pos = next_start_pos
+                    end_pos = cur_pos + 1
+                    next_start_pos = end_pos
+                    sentence_spans.append((start_pos, end_pos))
+            # Then apply mask to each individual sentence, because the sampled #mask depends on each sentence's length
+            for sentence_idx, sentence_span in enumerate(sentence_spans):
+                with data_utils.numpy_seed(seed, epoch, index, sentence_idx):
+                    s, e = sentence_span
+                    item = sample[s:e]
+                    assert len(item) >= 1
+                    assert item[-1] == self.eos
+                    if self.avoid_eos:
+                        item = item[:-1]
+
+                    sz = len(item)
+                    if sz == 0:
+                        assert self.avoid_eos
+                        # if this token is only eos, skip
+                        new_sample.append(torch.tensor([self.pad_idx]) if self.return_masked_tokens else torch.tensor([self.eos]))
+                        continue
+                    if sz == 1 and item[0] == self.eos:
+                        assert not self.avoid_eos
+                        # if only eos when not avoid_eos
+                        if np.random.uniform() <= 0.5: 
+                            new_sample.append(item if self.return_masked_tokens else torch.tensor([self.mask_idx]))
+                        else:
+                            new_sample.append(torch.tensor([self.pad_idx]) if self.return_masked_tokens else item)
+                        continue
+                    assert sz >= 1
+                    if self.mask_whole_words is not None:
+                        word_begins_mask = self.mask_whole_words.gather(0, item)
+                        word_begins_idx = word_begins_mask.nonzero().view(-1)
+                        sz = len(word_begins_idx)
+                        words = np.split(word_begins_mask, word_begins_idx)[1:]
+                        assert len(words) == sz
+                        word_lens = list(map(len, words))
+                    
+                    # decide elements to mask
+                    mask = np.full(sz, False)
+                    if self.seqlen_masking_flag:
+                        # if single token, we flip a fair coin, else, we sample from [1, seq_len)
+                        if self.seqlen_masking_boundary is None or sz == 1:
+                            num_mask = np.random.randint(int(sz > 1), sz)
+                        else:
+                            # Here, we use floor(h) and ceil(l) to increase #mask
+                            h = int(np.floor(self.seqlen_masking_high * sz))
+                            l = int(np.ceil(self.seqlen_masking_low * sz))
+                            try:
+                                num_mask = np.random.randint(l, min(sz, max(h, l + 1)))
+                            except:
+                                print(f"h: {h}")
+                                print(f"l: {l}")
+                                print(f"sz: {sz}")
+                                print()
+                                assert False
+                    elif self.learned_unmask_table:
+                        # use a precalculated learned unmask table: we sample the number of unmask token
+                        # while assuming sequence are all mask token
+                        if sz < 10:
+                            num_mask = 1
+                        else:
+                            unmask_info = self.learned_unmask_table[str(min(self.max_seq_length, sz))]
+                            num_mask = sz - int(np.random.choice(unmask_info[0], p=np.array(unmask_info[1])/np.sum(unmask_info[1])))
+                    else:
+                        num_mask = int(
+                            # add a random number for probabilistic rounding
+                            self.mask_prob * sz / float(self.mask_multiple_length)
+                            + np.random.rand()
+                        )
+                    # multiple masking as described in the vq-wav2vec paper (https://arxiv.org/abs/1910.05453)
+                    mask_idc = np.random.choice(sz, num_mask, replace=False)
+                    if self.mask_stdev > 0.0:
+                        lengths = np.random.normal(
+                            self.mask_multiple_length, self.mask_stdev, size=num_mask
+                        )
+                        lengths = [max(0, int(round(x))) for x in lengths]
+                        mask_idc = np.asarray(
+                            [
+                                mask_idc[j] + offset
+                                for j in range(len(mask_idc))
+                                for offset in range(lengths[j])
+                            ],
+                            dtype=np.int64,
+                        )
+                    else:
+                        mask_idc = np.concatenate(
+                            [mask_idc + i for i in range(self.mask_multiple_length)]
+                        )
+                    mask_idc = mask_idc[mask_idc < len(mask)]
+                    try:
+                        mask[mask_idc] = True
+                    except:  # something wrong
+                        print(
+                            "Assigning mask indexes {} to mask {} failed!".format(
+                                mask_idc, mask
+                            )
+                        )
+                        raise
+
+                    if self.return_masked_tokens:
+                        # exit early if we're just returning the masked tokens
+                        # (i.e., the targets for masked LM training)
+                        if self.mask_whole_words is not None:
+                            mask = np.repeat(mask, word_lens)
+                        new_item = np.full(len(mask), self.pad_idx)
+                        new_item[mask] = item[torch.from_numpy(mask.astype(np.uint8)) == 1]
+                        if self.avoid_eos:
+                            new_item = np.concatenate([new_item, [self.pad_idx]])
+                        new_sample.append(torch.from_numpy(new_item))
+                        continue
+                    
+                    # decide unmasking and random replacement
+                    rand_or_unmask_prob = self.random_token_prob + self.leave_unmasked_prob
+                    if rand_or_unmask_prob > 0.0:
+                        rand_or_unmask = mask & (np.random.rand(sz) < rand_or_unmask_prob)
+                        if self.random_token_prob == 0.0:
+                            unmask = rand_or_unmask
+                            rand_mask = None
+                        elif self.leave_unmasked_prob == 0.0:
+                            unmask = None
+                            rand_mask = rand_or_unmask
+                        else:
+                            unmask_prob = self.leave_unmasked_prob / rand_or_unmask_prob
+                            decision = np.random.rand(sz) < unmask_prob
+                            unmask = rand_or_unmask & decision
+                            rand_mask = rand_or_unmask & (~decision)
+                    else:
+                        unmask = rand_mask = None
+
+                    if unmask is not None:
+                        mask = mask ^ unmask
+
+                    if self.mask_whole_words is not None:
+                        mask = np.repeat(mask, word_lens)
+                    
+                    new_item = np.copy(item)
+                    new_item[mask] = self.mask_idx
+                    if rand_mask is not None:
+                        num_rand = rand_mask.sum()
+                        if num_rand > 0:
+                            if self.mask_whole_words is not None:
+                                rand_mask = np.repeat(rand_mask, word_lens)
+                                num_rand = rand_mask.sum()
+
+                            new_item[rand_mask] = np.random.choice(
+                                len(self.vocab),
+                                num_rand,
+                                p=self.weights,
+                            )
+                    if self.avoid_eos:
+                        new_item = np.concatenate([new_item, [self.eos]])
+                    new_sample.append(torch.from_numpy(new_item))
+            new_sample = torch.cat(new_sample)
+            assert new_sample.shape == sample_shape
+            return new_sample
+
+
+    @lru_cache(maxsize=8)
+    def __getitem_cached__(self, seed: int, epoch: int, index: int):
+        if self.seqlen_masking_granularity != "none":
+            # if we are not following MLM's sample break mode, then we use a separate but similar funcition to create sample.
+            return self.__getitem_cached_eos__(seed, epoch, index)
+        
+        with data_utils.numpy_seed(self.seed, self.epoch, index):
+            item = self.dataset[index]
+            sz = len(item)
+            
+            # we don't support this yet.
+            assert self.mask_whole_words is None
+
+            assert (
+                self.mask_idx not in item
+            ), "Dataset contains mask_idx (={}), this is not expected!".format(
+                self.mask_idx,
+            )
+            if self.mask_whole_words is not None:
+                word_begins_mask = self.mask_whole_words.gather(0, item)
+                word_begins_idx = word_begins_mask.nonzero().view(-1)
+                sz = len(word_begins_idx)
+                words = np.split(word_begins_mask, word_begins_idx)[1:]
+                assert len(words) == sz
+                word_lens = list(map(len, words))
+
+            # decide elements to mask
+            if self.mask_impl == "fix":
+                # if 'fix', we use the expectation of num_mask: sequence_length * mask_rate
+                mask = np.full(sz, False)
+
+                if self.seqlen_masking_flag:
+                    # uniformly sample from [1, sequence_length)
+                    num_mask = np.random.randint(1, sz)
+                elif self.mask_prob_range != "none":
+                    # Here, we use floor(h) and ceil(l) to add pertubation to #mask
+                    # uniformly sample from [l, h)
+                    h = int(np.floor(self.mask_prob_high * sz) + np.random.rand())
+                    l = int(np.ceil(self.mask_prob_low * sz) + np.random.rand())
+                    if l == h or l > h:
+                        num_mask = min(l, h)
+                    elif l < h:
+                        num_mask = np.random.randint(l, h)
+                    else:
+                        # l > h
+                        print(f"h: {h}")
+                        print(f"l: {l}")
+                        print(f"sz: {sz}")
+                        print()
+                        raise ValueError("l > h")
+                elif self.learned_unmask_table:
+                    # use a precalculated learned unmask table: we sample the number of unmask token
+                    # while assuming sequence are all mask token
+                    if sz < 10:
+                        num_mask = 1
+                    else:
+                        unmask_info = self.learned_unmask_table[str(min(self.max_seq_length, sz))]
+                        num_mask = sz - int(np.random.choice(unmask_info[0], p=np.array(unmask_info[1])/np.sum(unmask_info[1])))
+                else:
+                    num_mask = int(
+                        # add a random number for probabilistic rounding
+                        self.mask_prob * sz / float(self.mask_multiple_length)
+                        + np.random.rand()
+                    )
+                # multiple masking as described in the vq-wav2vec paper (https://arxiv.org/abs/1910.05453)
+                mask_idc = np.random.choice(sz, num_mask, replace=False)
+                if self.mask_stdev > 0.0:
+                    lengths = np.random.normal(
+                        self.mask_multiple_length, self.mask_stdev, size=num_mask
+                    )
+                    lengths = [max(0, int(round(x))) for x in lengths]
+                    mask_idc = np.asarray(
+                        [
+                            mask_idc[j] + offset
+                            for j in range(len(mask_idc))
+                            for offset in range(lengths[j])
+                        ],
+                        dtype=np.int64,
+                    )
+                else:
+                    mask_idc = np.concatenate(
+                        [mask_idc + i for i in range(self.mask_multiple_length)]
+                    )
+                mask_idc = mask_idc[mask_idc < len(mask)]
+                try:
+                    mask[mask_idc] = True
+                except:  # something wrong
+                    print(
+                        "Assigning mask indexes {} to mask {} failed!".format(
+                            mask_idc, mask
+                        )
+                    )
+                    raise
+            else:
+                # otherwise we sample from bernoulli
+                assert self.mask_multiple_length == 1
+                assert self.mask_stdev == 0.0
+                assert self.mask_impl == "bernoulli"
+                mask = np.random.choice([False, True], size=sz, p=[1-self.mask_prob, self.mask_prob])
+                print(f"num_mask: {(mask == True).sum()}")
+            if self.return_masked_tokens:
+                # exit early if we're just returning the masked tokens
+                # (i.e., the targets for masked LM training)
+                if self.mask_whole_words is not None:
+                    mask = np.repeat(mask, word_lens)
+                new_item = np.full(len(mask), self.pad_idx)
+                new_item[mask] = item[torch.from_numpy(mask.astype(np.uint8)) == 1]
+                return torch.from_numpy(new_item)
+
+            # decide unmasking and random replacement
+            rand_or_unmask_prob = self.random_token_prob + self.leave_unmasked_prob
+            if rand_or_unmask_prob > 0.0:
+                rand_or_unmask = mask & (np.random.rand(sz) < rand_or_unmask_prob)
+                if self.random_token_prob == 0.0:
+                    unmask = rand_or_unmask
+                    rand_mask = None
+                elif self.leave_unmasked_prob == 0.0:
+                    unmask = None
+                    rand_mask = rand_or_unmask
+                else:
+                    unmask_prob = self.leave_unmasked_prob / rand_or_unmask_prob
+                    decision = np.random.rand(sz) < unmask_prob
+                    unmask = rand_or_unmask & decision
+                    rand_mask = rand_or_unmask & (~decision)
+            else:
+                unmask = rand_mask = None
+
+            if unmask is not None:
+                mask = mask ^ unmask
+
+            if self.mask_whole_words is not None:
+                mask = np.repeat(mask, word_lens)
+
+            new_item = np.copy(item)
+            new_item[mask] = self.mask_idx
+            if rand_mask is not None:
+                num_rand = rand_mask.sum()
+                if num_rand > 0:
+                    if self.mask_whole_words is not None:
+                        rand_mask = np.repeat(rand_mask, word_lens)
+                        num_rand = rand_mask.sum()
+
+                    new_item[rand_mask] = np.random.choice(
+                        len(self.vocab),
+                        num_rand,
+                        p=self.weights,
+                    )
             return torch.from_numpy(new_item)

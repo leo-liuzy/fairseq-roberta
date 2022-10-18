@@ -5,7 +5,10 @@
 
 import logging
 import os
+import json
+from typing import Optional
 from dataclasses import dataclass, field
+from fairseq.pdb import distributed_set_trace
 
 import numpy as np
 from omegaconf import II, MISSING, OmegaConf
@@ -14,7 +17,7 @@ from fairseq import utils
 from fairseq.data import (
     Dictionary,
     IdDataset,
-    MaskTokensDataset,
+    MaskStrategyTokensDataset,
     NestedDictionaryDataset,
     NumelDataset,
     NumSamplesDataset,
@@ -28,8 +31,12 @@ from fairseq.data.encoders.utils import get_whole_word_mask
 from fairseq.data.shorten_dataset import maybe_shorten_dataset
 from fairseq.dataclass import FairseqDataclass
 from fairseq.tasks import FairseqTask, register_task
+from fairseq.dataclass import ChoiceEnum, FairseqDataclass
+
+from pdb import set_trace as bp
 
 from .language_modeling import SAMPLE_BREAK_MODE_CHOICES, SHORTEN_METHOD_CHOICES
+# MASK_IMPL_CHOICE = ChoiceEnum(["fix", "bernoulli"])
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +67,44 @@ class MaskedLMConfig(FairseqDataclass):
     mask_prob: float = field(
         default=0.15,
         metadata={"help": "probability of replacing a token with mask"},
+    )
+    mask_prob_range: str = field(
+        default="none",
+        metadata={"help": "probability range of replacing a token with mask"},
+    )
+    mask_impl: str = field(
+        default="fix",
+        metadata={"help": "If set to 'fix', calculate the expected number of mask for the current sequence/sentence"
+                  "If set to 'bernoulli', independently determine whether to mask a token by flipping a coin of success rate=`mask_prob`"},
+    )
+    seqlen_masking_flag: bool = field(
+        default=False,
+        metadata={"help": "True to adopt sequence length-based uniform masking"},
+    )
+    seqlen_masking_granularity: str = field(
+        default="none",
+        metadata={"help": 'If set to "eos", sample once num_mask for each sentence; a sequence may contains many sentences.'
+        'If omitted or "none", Follow MLM\'s sample once for entire sequence.'
+        'If set to "eos-eos", in addition to "eos", when masking, avoid masking eos'
+        },
+    )
+    seqlen_masking_boundary: Optional[str]= field(
+        # default="0.1-0.9",
+        default="none",
+        metadata={"help": "seq-len sample num_mask from [1,seq_len); this might have large variance,"
+                  "this argument is to reset the boundary to be e.g. [0.1*seq_len, 0.9*seq_len)"
+        },
+    )
+    use_learned_unmask_table : Optional[bool]= field(
+        default=False,
+        metadata={"help": "True to use learned unmask mappings"},
+    )
+    path_to_learned_unmask_table : Optional[str]= field(
+        default=None,
+        metadata={"help": "Path to learned unmask mappings. The table is structured as:"
+                  "sequence_length -> [[1,...,sequence_length], [prob(1),...., prob(sequence_length)]]"
+                  "Given a sequence_length, we assume all tokens are masked, "
+                  "and we sample how many tokens to unmask according to the probability in the second list"},
     )
     leave_unmasked_prob: float = field(
         default=0.1,
@@ -154,7 +199,6 @@ class MaskedLMTask(FairseqTask):
             self.cfg.tokens_per_sample,
             self.cfg.seed,
         )
-
         # create continuous blocks of tokens
         dataset = TokenBlockDataset(
             dataset,
@@ -164,9 +208,17 @@ class MaskedLMTask(FairseqTask):
             eos=self.source_dictionary.eos(),
             break_mode=self.cfg.sample_break_mode,
         )
-        logger.info("loaded {} blocks from: {}".format(len(dataset), split_path))
-
         # prepend beginning-of-sentence token (<s>, equiv. to [CLS] in BERT)
+        logger.info("loaded {} blocks from: {}".format(len(dataset), split_path))
+        dataset = TokenBlockDataset(
+            dataset,
+            dataset.sizes,
+            self.cfg.tokens_per_sample - 1,  # one less for <s>
+            pad=self.source_dictionary.pad(),
+            eos=self.source_dictionary.eos(),
+            break_mode=self.cfg.sample_break_mode,
+        )
+        logger.info("loaded {} blocks from: {}".format(len(dataset), split_path))
         return PrependTokenDataset(dataset, self.source_dictionary.bos())
 
     def load_dataset(self, split, epoch=1, combine=False, **kwargs):
@@ -183,14 +235,25 @@ class MaskedLMTask(FairseqTask):
             if self.cfg.mask_whole_words
             else None
         )
-
-        src_dataset, tgt_dataset = MaskTokensDataset.apply_mask(
+        learned_seqlen_unmask_table = json.load(open(self.cfg.path_to_learned_unmask_table, 'r')) if self.cfg.use_learned_unmask_table else None
+        # bp()
+        src_dataset, tgt_dataset = MaskStrategyTokensDataset.apply_mask(
             dataset,
             self.source_dictionary,
             pad_idx=self.source_dictionary.pad(),
             mask_idx=self.mask_idx,
             seed=self.cfg.seed,
             mask_prob=self.cfg.mask_prob,
+            mask_prob_range=self.cfg.mask_prob_range,
+            # seq-len arguments
+            seqlen_masking_flag=self.cfg.seqlen_masking_flag,
+            seqlen_masking_granularity=self.cfg.seqlen_masking_granularity,
+            seqlen_masking_boundary=self.cfg.seqlen_masking_boundary,
+            # arguement to use learned unmask
+            learned_unmask_table=learned_seqlen_unmask_table,
+            max_seq_length=self.cfg.tokens_per_sample,
+            bos=self.source_dictionary.bos(),
+            eos=self.source_dictionary.eos(),
             leave_unmasked_prob=self.cfg.leave_unmasked_prob,
             random_token_prob=self.cfg.random_token_prob,
             freq_weighted_replacement=self.cfg.freq_weighted_replacement,
@@ -198,6 +261,49 @@ class MaskedLMTask(FairseqTask):
             mask_multiple_length=self.cfg.mask_multiple_length,
             mask_stdev=self.cfg.mask_stdev,
         )
+
+        # if self.cfg.seqlen_masking_granularity != "none":
+        #     # if eos, src and tgt have 1 sentence per samepl, 
+        #     # we need to make sure src and tgt follow self.cfg.sample_break_mode
+        #     src_dataset, tgt_dataset = MaskStrategyTokensDataset.apply_mask(
+        #         dataset,
+        #         self.source_dictionary,
+        #         pad_idx=self.source_dictionary.pad(),
+        #         mask_idx=self.mask_idx,
+        #         seed=self.cfg.seed,
+        #         mask_prob=self.cfg.mask_prob,
+        #         seqlen_masking_flag=self.cfg.seqlen_masking_flag,
+        #         seqlen_masking_granularity=self.cfg.seqlen_masking_granularity,
+        #         bos=self.source_dictionary.bos(),
+        #         eos=self.source_dictionary.eos(),
+        #         leave_unmasked_prob=self.cfg.leave_unmasked_prob,
+        #         random_token_prob=self.cfg.random_token_prob,
+        #         freq_weighted_replacement=self.cfg.freq_weighted_replacement,
+        #         mask_whole_words=mask_whole_words,
+        #         mask_multiple_length=self.cfg.mask_multiple_length,
+        #         mask_stdev=self.cfg.mask_stdev,
+        #     )
+        # else:
+        #     src_dataset, tgt_dataset = MaskStrategyTokensDataset.apply_mask(
+        #         dataset,
+        #         self.source_dictionary,
+        #         pad_idx=self.source_dictionary.pad(),
+        #         mask_idx=self.mask_idx,
+        #         seed=self.cfg.seed,
+        #         mask_prob=self.cfg.mask_prob,
+        #         mask_impl=self.cfg.mask_impl,
+        #         seqlen_masking_flag=self.cfg.seqlen_masking_flag,
+        #         leave_unmasked_prob=self.cfg.leave_unmasked_prob,
+        #         random_token_prob=self.cfg.random_token_prob,
+        #         freq_weighted_replacement=self.cfg.freq_weighted_replacement,
+        #         mask_whole_words=mask_whole_words,
+        #         mask_multiple_length=self.cfg.mask_multiple_length,
+        #         mask_stdev=self.cfg.mask_stdev,
+        #     )
+        # src_dataset[0]
+        # tgt_dataset[0]
+        # distributed_set_trace()
+        # print()
 
         with data_utils.numpy_seed(self.cfg.seed):
             shuffle = np.random.permutation(len(src_dataset))
