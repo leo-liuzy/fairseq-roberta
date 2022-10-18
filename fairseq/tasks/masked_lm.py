@@ -8,7 +8,6 @@ import os
 import json
 from typing import Optional
 from dataclasses import dataclass, field
-from fairseq.pdb import distributed_set_trace
 
 import numpy as np
 from omegaconf import II, MISSING, OmegaConf

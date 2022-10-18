@@ -9,7 +9,7 @@ from functools import lru_cache
 import numpy as np
 import torch
 from fairseq.data import Dictionary, data_utils
-from fairseq.pdb import distributed_set_trace as bp
+from fairseq.pdb import set_trace as bp
 
 from . import BaseWrapperDataset, LRUCacheDataset
 
